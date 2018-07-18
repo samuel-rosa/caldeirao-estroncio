@@ -1,0 +1,16 @@
+---
+title: "Distribuição espacial do conteúdo de estrôncio na área do Caldeirão, Amazonas"
+author: "Alessandro Samuel-Rosa"
+date: "18 Julho 2018"
+url: ""
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Material e Métodos
+
+Os dados do conteúdo de estrôncio na fração terra fina seca ao ar do solo da área do Caldeirão, Amazonas,
+estão disponíveis no Repositório Brasileiro Livre para Dados Abertos do Solo, conjunto de dados `ctb0018`.
