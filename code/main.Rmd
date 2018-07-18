@@ -6,11 +6,236 @@ url: ""
 output: html_document
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+# Configurações iniciais
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE, fig.asp = 1)
+source("../../caldeirao-stocks/code/helper.R")
+library(febr)
+library(lattice)
+library(magrittr)
+library(dplyr)
+library(sp)
+
+# Inicializar GRASS GIS
+spgrass7::initGRASS(
+  gisBase = gisBase, gisDbase = "../../caldeirao-stocks/data/GRASS", location = "caldeirao", 
+  mapset = "predictions", override = TRUE, pid = Sys.getpid())
 ```
 
-# Material e Métodos
+# Dados do solo
 
 Os dados do conteúdo de estrôncio na fração terra fina seca ao ar do solo da área do Caldeirão, Amazonas,
-estão disponíveis no Repositório Brasileiro Livre para Dados Abertos do Solo, conjunto de dados `ctb0018`.
+estão disponíveis no Repositório Brasileiro Livre para Dados Abertos do Solo, conjunto de dados `ctb0018`. Os
+dados foram descarregados e armazenados localmente para facilitar os trabalhos.
+
+```{r}
+if (!file.exists("../data/camada.rda")) {
+  camada <- febr::layer("ctb0018", variable = "estroncio", standardization = list(repetition = "combine"))
+  save(camada, file = "../data/camada.rda")
+} else {
+  load("../data/camada.rda")
+}
+if (!file.exists("../data/observacao.rda")) {
+  observacao <- febr::observation("ctb0018")
+  save(observacao, file = "../data/observacao.rda")
+} else {
+  load("../data/observacao.rda")
+}
+```
+
+```{r, fig.asp=1}
+histogram.febr <- 
+  function(x, data, col = "gray", type = c("percent", "count", "density"), ...) {
+    
+    type <- match.arg(type)
+    
+    # Título do eixo x
+    y <- colnames(attributes(terms.formula(x))$factors)
+    var_id <- which(attr(x = data, which = "names") == y)
+    if ("field_name" %in% names(attributes(data))) {
+      field_name <- attr(x = data, which = "field_name")[var_id]
+    if (is.na(field_name)) {
+      field_name <- y
+    }
+      field_unit <- attr(x = data, which = "field_unit")[var_id]
+      xlab <- glue::glue("{field_name} ({field_unit})")
+    } else {
+      xlab <- y
+    }
+    
+    # Título do eixo y
+    ylab <- switch (type,
+      percent = {
+        "Porcentagem do total"
+      },
+      count = {
+        "Contagem"
+      },
+      density = {
+        "Histograma de densidade com ajuste normal"
+      }
+    )
+    
+    # Cria histograma
+    p <- 
+      lattice::histogram(
+        x = x, data = data, col = col, ylab = ylab, xlab = xlab, ..., type = type,
+        panel = function (x, ...) {
+          panel.grid(v = -1, h = -1)
+          panel.histogram(x, ...)
+          panel.rug(x, ...)
+        })
+    if (type == "density") {
+    p <- p +
+      latticeExtra::layer(
+        panel.mathdensity(
+          dmath = dnorm, args = list(mean = mean(x, na.rm = TRUE), sd = sd(x, na.rm = TRUE)),
+          col = 'black', lty = 'dashed'))
+    }
+    
+    # Output
+    p
+  }
+png("../res/fig/histograma-geral.png", width = 480 * 2, height = 480 * 2, res = 72 * 2)
+histogram.febr(~ estroncio_aquaregia_icpms, camada, type = "density")
+dev.off()
+```
+
+```{r, fig.asp=1}
+png("../res/fig/boxplot-camadas.png", width = 480 * 2, height = 480 * 2, res = 72 * 2)
+depth_bwplot(
+  pts = camada, vars = "estroncio_aquaregia_icpms", depth.var = "profund_sup",
+  ylab = "Profundidade de amostragem (cm)", xlab = "Conteúdo de estrôncio (ppm)")
+dev.off()
+```
+
+```{r}
+dataset <- merge(x = observacao, y = camada, by = c("dataset_id", "observacao_id"))
+coordinates(dataset) <- ~ coord_x + coord_y
+sp::proj4string(dataset) <- sp::CRS("+init=epsg:32720")
+dataset %>% 
+  st_as_sf() %>%
+  select(estroncio_aquaregia_icpms, profund_sup) %>% 
+  group_by(profund_sup) %>% 
+  do(plot = plot(.))
+```
+
+# Modelagem dos efeitos fixos
+
+```{r}
+# Load covariate data
+covar <- spgrass7::readRAST("past_landuse")
+covar$past_landuse <- (covar$past_landuse - min(covar$past_landuse, na.rm = TRUE)) / 
+  (max(covar$past_landuse, na.rm = TRUE) - min(covar$past_landuse, na.rm = TRUE))
+covar$past_landuse <- exp(covar$past_landuse)
+image(covar)
+```
+
+```{r}
+soil_var <- prepare_soil_data(
+  pointData = dataset, sv = "estroncio_aquaregia_icpms", covar = covar, id.var = "observacao_id", 
+  depth.var = "profund_sup")
+get_lm_output(soil_var = soil_var, sv = "estroncio_aquaregia_icpms", d = seq(0, 80, 20)) %>% 
+  pander::pandoc.table()
+```
+
+# Mixed effects modelling
+
+```{r}
+depth <- unique(dataset$profund_sup)
+range <- c(50, 75, 100)
+```
+
+```{r, fig.asp=1}
+sv <- "estroncio_aquaregia_icpms"
+sr_data <- prepare_soil_data(
+  pointData = dataset, sv = sv, covar = covar, save4back = TRUE, id.var = "observacao_id", 
+  depth.var = "profund_sup")
+colnames(sr_data@data) <- gsub("estroncio_aquaregia_icpms", "Sr", colnames(sr_data@data))
+sv <- "Sr"
+
+# fit competing cross-variogram models
+sr_vario <- compute_sample_variogram(soil_data = sr_data, sv = sv, cross = TRUE)
+plot(sr_vario$v, scales = list(relation = "same"), pch = 20, cex = 0.5)
+```
+
+```{r, fig.asp=1}
+sr_cross <- parallel::mclapply(1:length(range), function (i)
+  gstat::gstat(
+    sr_vario$g, id = paste(sv, ".", depth[1], sep = ""),
+    model = gstat::vgm(psill = 0.6, model = "Exp", range = range[i], nugget = 0.1), fill.all = TRUE))
+sr_lmc <- parallel::mclapply(1:length(sr_cross), function (i)
+  gstat::fit.lmc(v = sr_vario$v, g = sr_cross[[i]], correct.diagonal = 1.01))
+
+# cross-validation
+sr_cv <- parallel::mclapply(
+  sr_lmc, gstat::gstat.cv, nfold = length(unique(dataset$observacao_id)), remove.all = TRUE, 
+  all.residuals = TRUE, boundaries = attr(sr_vario$v, "boundaries"), correct.diagonal = 1.01)
+ave <-
+  sapply(sr_cv, function (x) {
+    res <- 
+      sapply(sr_data@data %>% select(Sr.0, Sr.20, Sr.40, Sr.60, Sr.80), scale, center = TRUE, scale = FALSE)
+    res <- sum(res * res)
+    err <- (sr_data@data %>% select(Sr.0, Sr.20, Sr.40, Sr.60, Sr.80) - x)
+    err <- colSums(err * err)
+    round(1 - (err / res), 4)
+  })
+ave
+```
+
+```{r}
+sr_cv <- round(do.call(rbind, lapply(sr_cv, colMeans)), 4)
+apply(abs(sr_cv), 2, which.min); apply(abs(sr_cv), 2, which.max)
+sr_cv <- sr_cv[1, ]
+sr_lmc <- sr_lmc[[1]]
+
+# save results
+save(sr_vario, sr_lmc, file = "../res/r/sr_vario.rda")
+
+# plot(sr_vario$v, sr_lmc, scales = list(relation = "same"), pch = 20, cex = 0.5)
+# round(slope(sr_lmc), 4)
+
+# prepare variogram plot
+sr_plot <-
+  plot(sr_vario$v, sr_lmc, scales = list(relation = "same"), pch = 20, cex = 0.5,
+       col = "black", strip = lattice::strip.custom(bg = "lightgray"),  xlab = "Distance (m)",
+       ylab = "Semivariance (-)")
+tmp <- sr_plot + addGridLines
+sr_plot <- tmp + latticeExtra::as.layer(sr_plot)
+png("../res/fig/sr_cross_vario.png", width = 480 * 3, height = 480 * 3, res = 72 * 3)
+sr_plot
+dev.off()
+```
+
+
+### Spatial prediction
+
+```{r}
+if (file.exists("../res/r/tooc_pred.rda")) {
+  load("../res/r/tooc_pred.rda")
+} else {
+  t0 <- proc.time()
+  sr_pred <- predict(object = sr_lmc, newdata = covar)
+  proc.time() - t0
+  sr_pred <- back_transform(pred = sr_pred, soil_data = sr_data)
+  save(sr_pred, file = "../res/r/sr_pred.rda")
+}
+```
+
+```{r}
+# save figure with depth-wise predictions
+map <- layer_predictions(x = sr_pred, var = "pred", pts = dataset, depth.var = "profund_sup")
+png(filename = "../res/fig/sr_pred.png", height = 480 * 1.4, width = 480 * 4, res = 72 * 3)
+map
+dev.off()
+rm(map)
+
+# save figure with depth-wise prediction error standard deviation
+map <- layer_predictions(sr_pred, "var", pts = dataset, depth.var = "profund_sup")
+png(filename = "../res/fig/sr_sd.png", height = 480 * 1.4, width = 480 * 4, res = 72 * 3)
+map
+dev.off()
+rm(map)
+```
+
